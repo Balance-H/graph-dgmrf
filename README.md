@@ -114,5 +114,5 @@ These can easily be adapted to run the baselines also on the other datasets if t
 ## Questions and contact Information
 If you have any questions about the code please open a github issue.
 
-Contact: [Joel Oskarsson](mailto:joel.oskarsson@liu.se)
+Contact: [Joel Oskarsson](https://joeloskarsson.github.io/)
 
