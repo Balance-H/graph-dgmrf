@@ -71,7 +71,7 @@ Baseline models can be trained and evaluated using `eval_baseline.py`. Run `pyth
 We provide both pre-processed and original versions of all datasets.
 The synthetic datasets used are available in the `dataset` directory.
 
-The real-world datasets are available at [this link](https://liuonline-my.sharepoint.com/:f:/g/personal/joeos82_liu_se/EvSdihMH15tBk-ZL0-yV7NQBlA4rKWtVXKs1WkTJCRsT5w?e=w74LiQ).
+The real-world datasets are available at [this link](https://drive.google.com/drive/folders/1k3yHvK0fNY7gsJEqSaQr2IYgPsx3nZi4?usp=sharing).
 After downloading these datasets move the files to the `raw_data` or `dataset` directories to make them accesible to the scripts.
 The original data can also be retrieved from:
 
