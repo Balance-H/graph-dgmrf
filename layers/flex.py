@@ -90,7 +90,7 @@ class FlexLayer(LinearLayer):
             degree_contrib = self.degree_power*self.sum_log_degrees # From D^gamma
             return agg_contrib + degree_contrib
         elif self.decomp_log_det:
-            # Graph decomposition method (recursive Schur complement)
+            # Graph decomposition method
             device = self.log_degrees.device
             edge_index = self.edge_index.to(device)
             edge_weights = torch.ones(edge_index.shape[1], device=device)
@@ -112,127 +112,22 @@ class FlexLayer(LinearLayer):
                 + self.neighbor_weight * (torch.diag(degree_gamma_minus) @ adjacency)
             )
 
-            def _is_atom(x):
-                return (
-                    isinstance(x, (list, tuple))
-                    and len(x) > 0
-                    and all(isinstance(t, int) for t in x)
-                )
-
-            def _collect_nodes(x):
-                if _is_atom(x):
-                    return set(x)
-                if isinstance(x, (list, tuple)):
-                    nodes = set()
-                    for y in x:
-                        nodes |= _collect_nodes(y)
-                    return nodes
-                return set()
-
-            def _split_decomp(atoms, seps):
-                if not isinstance(atoms, (list, tuple)) or len(atoms) < 2:
-                    return None
-                left_atoms = atoms[0]
-                right_atoms = atoms[1]
-                sep = None
-                left_seps = None
-                right_seps = None
-                if _is_atom(seps):
-                    sep = list(seps)
-                elif isinstance(seps, (list, tuple)):
-                    if len(seps) == 3 and _is_atom(seps[0]):
-                        sep = list(seps[0])
-                        left_seps = seps[1]
-                        right_seps = seps[2]
-                    elif len(seps) == 1 and _is_atom(seps[0]):
-                        sep = list(seps[0])
-                return left_atoms, right_atoms, sep, left_seps, right_seps
-
-            def _logdet(matrix):
-                sign, logabsdet = torch.linalg.slogdet(matrix)
+            def submatrix_logdet(indices):
+                idx = torch.tensor(indices, device=device)
+                sub = omega.index_select(0, idx).index_select(1, idx)
+                sign, logabsdet = torch.linalg.slogdet(sub)
                 return logabsdet
 
-            def _solve_spd(matrix, rhs):
-                chol = torch.linalg.cholesky(matrix)
-                return torch.cholesky_solve(rhs, chol)
-
-            def _recursive_logdet(matrix, nodes, atoms, seps):
-                if _is_atom(atoms):
-                    return _logdet(matrix)
-
-                split = _split_decomp(atoms, seps)
-                if split is None:
-                    return _logdet(matrix)
-
-                left_atoms, right_atoms, sep, left_seps, right_seps = split
-                if not sep:
-                    return _logdet(matrix)
-
-                left_nodes = _collect_nodes(left_atoms)
-                right_nodes = _collect_nodes(right_atoms)
-                sep_nodes = set(sep)
-
-                a_nodes = [n for n in left_nodes if n not in sep_nodes]
-                b_nodes = [n for n in right_nodes if n not in sep_nodes]
-                s_nodes = [n for n in sep_nodes]
-
-                node_index = {n: i for i, n in enumerate(nodes)}
-                a_idx = [node_index[n] for n in a_nodes if n in node_index]
-                b_idx = [node_index[n] for n in b_nodes if n in node_index]
-                s_idx = [node_index[n] for n in s_nodes if n in node_index]
-
-                if len(a_idx) == 0 or len(b_idx) == 0 or len(s_idx) == 0:
-                    return _logdet(matrix)
-
-                a_idx_t = torch.tensor(a_idx, device=device)
-                b_idx_t = torch.tensor(b_idx, device=device)
-                s_idx_t = torch.tensor(s_idx, device=device)
-
-                omega_aa = matrix.index_select(0, a_idx_t).index_select(1, a_idx_t)
-                omega_bb = matrix.index_select(0, b_idx_t).index_select(1, b_idx_t)
-                omega_ss = matrix.index_select(0, s_idx_t).index_select(1, s_idx_t)
-                omega_as = matrix.index_select(0, a_idx_t).index_select(1, s_idx_t)
-                omega_sa = omega_as.transpose(0, 1)
-                omega_bs = matrix.index_select(0, b_idx_t).index_select(1, s_idx_t)
-                omega_sb = omega_bs.transpose(0, 1)
-
-                inv_aa_omega_as = _solve_spd(omega_aa, omega_as)
-                inv_bb_omega_bs = _solve_spd(omega_bb, omega_bs)
-
-                sigma_s_inv = omega_ss - omega_sa @ inv_aa_omega_as - omega_sb @ inv_bb_omega_bs
-                sigma_as_block = omega_ss - omega_sb @ inv_bb_omega_bs
-                sigma_bs_block = omega_ss - omega_sa @ inv_aa_omega_as
-
-                sigma_aus_inv = torch.cat(
-                    [
-                        torch.cat([omega_aa, omega_as], dim=1),
-                        torch.cat([omega_sa, sigma_as_block], dim=1),
-                    ],
-                    dim=0,
-                )
-                sigma_bus_inv = torch.cat(
-                    [
-                        torch.cat([omega_bb, omega_bs], dim=1),
-                        torch.cat([omega_sb, sigma_bs_block], dim=1),
-                    ],
-                    dim=0,
-                )
-
-                logdet_s = _logdet(sigma_s_inv)
-                left_nodes_full = a_nodes + s_nodes
-                right_nodes_full = b_nodes + s_nodes
-
-                logdet_left = _recursive_logdet(
-                    sigma_aus_inv, left_nodes_full, left_atoms, left_seps
-                )
-                logdet_right = _recursive_logdet(
-                    sigma_bus_inv, right_nodes_full, right_atoms, right_seps
-                )
-
-                return -logdet_s + logdet_left + logdet_right
-
-            all_nodes = list(range(self.num_nodes))
-            return _recursive_logdet(omega, all_nodes, self.atoms_decomp, self.seps_decomp)
+            atoms_logdet = torch.sum(torch.stack([
+                submatrix_logdet(atom) for atom in self.atoms_decomp
+            ]))
+            if len(self.seps_decomp) == 0:
+                seps_logdet = torch.zeros(1, device=device, dtype=self.log_degrees.dtype)
+            else:
+                seps_logdet = torch.sum(torch.stack([
+                    submatrix_logdet(sep) for sep in self.seps_decomp
+                ]))
+            return atoms_logdet - seps_logdet
         else:
             # Power series method, using DAD traces
             alpha_contrib = self.num_nodes*self.alpha1_param
