@@ -7,6 +7,9 @@ import os
 import time
 import pickle
 import argparse
+import igraph as ig
+import decom_h  # noqa: E402
+
 import wandb
 import copy
 
@@ -57,7 +60,7 @@ def get_config():
 
     # Training
     parser.add_argument("--log_det_method", type=str, default="eigvals",
-        help="Method for log-det. computations (eigvals/dad), dad is using power series")
+        help="Method for log-det. computations (eigvals/dad/decomp), dad uses power series")
     parser.add_argument("--n_iterations", type=int,
             help="How many iterations to train for", default=1000)
     parser.add_argument("--val_interval", type=int, default=100,
@@ -134,8 +137,41 @@ def main():
     dataset_dict = utils.load_dataset(config["dataset"])
     graph_y = dataset_dict["graph_y"]
 
-    if config["features"]:
-        assert hasattr(graph_y, "features"), "No features found for dataset"
+    #heng
+    # ---- precompute CMSA decomposition once and store on graph_y ----
+    if config["log_det_method"] == "decomp":
+        edge_index = graph_y.edge_index.detach().cpu().numpy()  # (2, E)
+        n = int(graph_y.num_nodes) if hasattr(graph_y, "num_nodes") else int(graph_y.x.shape[0])
+
+        edges = list(zip(edge_index[0].tolist(), edge_index[1].tolist()))
+        g = ig.Graph(n=n, edges=edges, directed=False)
+        g.simplify(multiple=True, loops=True)
+
+        atoms, separators = decom_h.recursive_decom(g, method="cmsa")
+
+        # flatten nested lists once
+        def _flatten(x):
+            out = []
+            if isinstance(x, (list, tuple)):
+                if len(x) == 0:
+                    return out
+                if all(isinstance(t, int) for t in x):
+                    out.append(list(x))
+                else:
+                    for y in x:
+                        out.extend(_flatten(y))
+            return out
+
+        graph_y.atoms_decomp = _flatten(atoms)
+        graph_y.seps_decomp  = _flatten(separators)  
+
+        print(f"[decomp] cached: #atoms={len(graph_y.atoms_decomp)}, #seps={len(graph_y.seps_decomp)}")
+
+        #heng
+
+
+        if config["features"]:
+            assert hasattr(graph_y, "features"), "No features found for dataset"
 
     # Init wandb
     wandb_name = "{}-{}".format(config["dataset"],
