@@ -1,0 +1,17 @@
+{
+    "compute_dad_traces": 0,
+    "compute_eigvals": 1,
+    "dad_k_max": 50,
+    "dad_samples": 1000,
+    "dataset": "cal",
+    "decom_max_size": 1000,
+    "dist_weight": 0,
+    "dist_weight_eps": 0.01,
+    "graph_alg": "decom_graph",
+    "mask_fraction": 0.25,
+    "mst_k": 32,
+    "n_neighbors": 5,
+    "plot": 0,
+    "random_mask": 1,
+    "seed": 42
+}
