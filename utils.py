@@ -270,3 +270,147 @@ def log_det_preprocess(graph, dist_weight, comp_eigvals, comp_dad_traces,
             graph.weighted_dad_traces = compute_dad_traces(graph, dad_k_max,
                 dad_samples, weighted = True)
 
+
+#heng
+import torch
+
+
+def decomp_logdet_schur_cached(
+    graph,
+    degrees,
+    a1,
+    a2,
+    gamma,
+    eps=1e-6,
+):
+    """
+    Fast exact log|det(Omega)| using cached atom-tree + cached per-atom internal edges.
+
+    Requires graph to have caches created by prepare_decomp_cache():
+      graph.decomp_tree, graph.decomp_par, graph.decomp_post, graph.decomp_sep_to_par,
+      graph.decomp_atom_data (list of dict)
+
+    Omega = a1 * D^gamma + a2 * D^(gamma-1) * A
+    """
+    device = degrees.device
+    dtype = degrees.dtype
+    degrees = degrees.to(device=device, dtype=dtype).clamp_min(1.0)
+
+    tree = graph.decomp_tree
+    par = graph.decomp_par
+    post = graph.decomp_post
+    sep_to_par = graph.decomp_sep_to_par
+    atom_data = graph.decomp_atom_data
+
+    m = len(atom_data)
+    msg_schur = [None] * m
+    msg_logdet = [None] * m
+
+    # Quick path for tree-like decompositions: when atoms are edges (size 2)
+    # and there are N-1 atoms, building full Omega + Cholesky is usually
+    # faster and avoids potential corner cases in junction-tree handling.
+    try:
+        N = int(degrees.numel())
+        if m == (N - 1) and all(int(d['nodes'].numel()) == 2 for d in atom_data):
+            # build full Omega from graph (use edge attributes if present)
+            ei = graph.edge_index
+            if ei.dim() == 1:
+                ei = ei.view(2, -1)
+            src = ei[0].to(device=device).view(-1).long()
+            dst = ei[1].to(device=device).view(-1).long()
+            E = int(src.numel())
+            if hasattr(graph, 'edge_attr') and graph.edge_attr is not None:
+                ew_all = graph.edge_attr[:, 0].to(device=device, dtype=dtype)
+            else:
+                ew_all = torch.ones(E, device=device, dtype=dtype)
+
+            # Build full dense Omega
+            degrees_clamped = degrees.clamp_min(1.0)
+            diag = a1 * torch.pow(degrees_clamped, gamma)
+            M = torch.diag(diag)
+            off = a2 * torch.pow(degrees_clamped[dst], gamma - 1.0) * ew_all
+            M.index_put_((dst, src), off, accumulate=True)
+            M = 0.5 * (M + M.t())
+            M = M + eps * torch.eye(N, device=device, dtype=dtype)
+
+            L = torch.linalg.cholesky(M)
+            return 2.0 * torch.sum(torch.log(torch.diagonal(L)))
+    except Exception:
+        # If quick path fails for any reason, continue to full decomp
+        pass
+
+    for u in post:
+        data_u = atom_data[u]
+        nodes_u = data_u["nodes"]          # (k,)
+        k = int(nodes_u.numel())
+
+        # ---- build local M_u quickly (no scanning full edge list) ----
+        d_u = degrees[nodes_u]
+        diag = a1 * torch.pow(d_u, gamma)
+        M_u = torch.diag(diag)
+
+        ls = data_u["ls"]
+        ld = data_u["ld"]
+        if ls.numel() > 0:
+            dstg = data_u["dstg"]
+            ew = data_u["ew"].to(device=device, dtype=dtype)
+            d_dst = degrees[dstg]
+            off = a2 * torch.pow(d_dst, gamma - 1.0) * ew
+            M_u.index_put_((ld, ls), off, accumulate=True)
+
+        # Symmetrize + jitter
+        M_u = 0.5 * (M_u + M_u.t())
+        M_u = M_u + eps * torch.eye(k, device=device, dtype=dtype)
+
+        total_logdet = M_u.new_zeros(())
+
+        # ---- absorb children Schur messages onto separators ----
+        node2local = data_u["node2local"]  # python dict (fast for small sep)
+        for v, sep_uv in tree[u]:
+            if par[v] == u:
+                total_logdet = total_logdet + msg_logdet[v]
+                sch = msg_schur[v]
+
+                # Try to use cached local separator indices if available (fast path)
+                seps_local = data_u.get("seps_local", None)
+                if seps_local is not None and (v in seps_local):
+                    idx = seps_local[v]
+                else:
+                    # fallback (should be rare); compute mapping
+                    idx = torch.tensor([node2local[n] for n in sep_uv],
+                                       dtype=torch.long, device=device)
+                M_u.index_put_((idx[:, None], idx[None, :]), sch, accumulate=True)
+
+        # ---- eliminate internal variables; send Schur to parent ----
+        if par[u] != -1:
+            sep_nodes = sep_to_par[u]
+            keep = torch.tensor([node2local[n] for n in sep_nodes],
+                                dtype=torch.long, device=device)
+
+            mask_keep = torch.zeros(k, device=device, dtype=torch.bool)
+            mask_keep[keep] = True
+            elim = torch.nonzero(~mask_keep, as_tuple=False).view(-1)
+
+            M_ee = M_u.index_select(0, elim).index_select(1, elim)
+            M_ek = M_u.index_select(0, elim).index_select(1, keep)
+            M_ke = M_ek.t()
+            M_kk = M_u.index_select(0, keep).index_select(1, keep)
+
+            L = torch.linalg.cholesky(M_ee)
+            logdet_ee = 2.0 * torch.sum(torch.log(torch.diagonal(L)))
+
+            X = torch.cholesky_solve(M_ek, L)     # inv(M_ee) M_ek
+            schur = M_kk - M_ke @ X
+
+            schur = 0.5 * (schur + schur.t())
+            schur = schur + eps * torch.eye(schur.shape[0], device=device, dtype=dtype)
+
+            msg_schur[u] = schur
+            msg_logdet[u] = total_logdet + logdet_ee
+        else:
+            # root
+            L = torch.linalg.cholesky(M_u)
+            logdet_root = 2.0 * torch.sum(torch.log(torch.diagonal(L)))
+            return total_logdet + logdet_root
+
+    raise RuntimeError("decomp_logdet_schur_cached: did not return at root")
