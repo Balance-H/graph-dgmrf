@@ -114,6 +114,188 @@ def seed_all(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+
+def prepare_decomp_cache(graph_y, atoms, edge_weight=None):
+    """
+    Precompute and cache everything needed for fast decomp logdet:
+      - atom-tree (tree adjacency with separators)
+      - parent array, post-order traversal
+      - per-atom local data: nodes tensor, node->local dict,
+        and internal edges in local indices (ls, ld) + dst_global + ew
+
+    atoms: list[list[int]] 0-based
+    edge_weight: torch tensor (E,) or None
+    """
+    import torch
+
+    # ---- basic ----
+    N = graph_y.num_nodes
+    edge_index = graph_y.edge_index
+    # Ensure edge_index has shape (2, E). Some versions / code paths may provide a
+    # flattened 1-D tensor; coerce to (2, -1) to avoid downstream scalar indexing.
+    if hasattr(edge_index, 'dim') and edge_index.dim() == 1:
+        edge_index = edge_index.view(2, -1)
+    device = edge_index.device
+    # `.tolist()` may return an int for 0-dim tensors; coerce to list for robustness
+    src_tmp = edge_index[0].cpu().tolist()
+    dst_tmp = edge_index[1].cpu().tolist()
+    src = src_tmp if isinstance(src_tmp, list) else [src_tmp]
+    dst = dst_tmp if isinstance(dst_tmp, list) else [dst_tmp]
+    E = len(src)
+
+    # cache atoms
+    graph_y.atoms_decomp = atoms
+    m = len(atoms)
+
+    # ---- 1) build atom-tree ONCE (same logic as before, but one-time) ----
+    atom_sets = [set(a) for a in atoms]
+    cand = []
+    for i in range(m):
+        si = atom_sets[i]
+        for j in range(i + 1, m):
+            inter = si.intersection(atom_sets[j])
+            w = len(inter)
+            if w > 0:
+                cand.append((w, i, j, list(inter)))
+    cand.sort(key=lambda x: x[0], reverse=True)
+
+    parent = list(range(m))
+    rank = [0] * m
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx == ry:
+            return False
+        if rank[rx] < rank[ry]:
+            parent[rx] = ry
+        elif rank[rx] > rank[ry]:
+            parent[ry] = rx
+        else:
+            parent[ry] = rx
+            rank[rx] += 1
+        return True
+
+    tree = [[] for _ in range(m)]  # tree[u] : list[(v, sep_nodes_uv)]
+    picked = 0
+    for w, i, j, sep in cand:
+        if union(i, j):
+            tree[i].append((j, sep))
+            tree[j].append((i, sep))
+            picked += 1
+            if picked == m - 1:
+                break
+
+    if m > 1 and picked != m - 1:
+        raise RuntimeError("Atoms do not form a connected atom-tree via intersections.")
+
+    # ---- 2) root=0, build parent + postorder ONCE ----
+    root = 0
+    par = [-1] * m
+    sep_to_par = [None] * m
+    stack = [root]
+    order = []
+    seen = [False] * m
+    while stack:
+        u = stack.pop()
+        if seen[u]:
+            continue
+        seen[u] = True
+        order.append(u)
+        for v, sep in tree[u]:
+            if not seen[v]:
+                par[v] = u
+                sep_to_par[v] = sep
+                stack.append(v)
+    post = order[::-1]
+
+    graph_y.decomp_tree = tree
+    graph_y.decomp_par = par
+    graph_y.decomp_post = post
+    graph_y.decomp_sep_to_par = sep_to_par
+
+    # ---- 3) precompute per-node -> atoms list (for fast edge assignment) ----
+    node2atoms = [[] for _ in range(N)]
+    atom_node2local = [None] * m
+    atom_nodes_tensor = [None] * m
+
+    for ai, nodes in enumerate(atoms):
+        # nodes are python ints
+        for idx, n in enumerate(nodes):
+            node2atoms[n].append(ai)
+        atom_node2local[ai] = {n: idx for idx, n in enumerate(nodes)}
+        atom_nodes_tensor[ai] = torch.tensor(nodes, dtype=torch.long, device=device)
+
+    # ---- 4) assign each edge to all atoms that contain both endpoints ----
+    # store temporary python lists (fast append)
+    atom_ls = [[] for _ in range(m)]
+    atom_ld = [[] for _ in range(m)]
+    atom_dstg = [[] for _ in range(m)]
+    atom_ew = [[] for _ in range(m)]
+
+    # edge weights to cpu list for quick indexing
+    if edge_weight is None:
+        ew_list = None
+    else:
+        ew_list = edge_weight.detach().cpu().tolist()
+
+    for e in range(E):
+        s = src[e]
+        d = dst[e]
+        # atoms that contain s AND d
+        # (node2atoms membership is usually small in decompositions)
+        as_list = node2atoms[s]
+        ad_list = node2atoms[d]
+        if not as_list or not ad_list:
+            continue
+        common = set(as_list).intersection(ad_list)
+        if not common:
+            continue
+
+        w = 1.0 if ew_list is None else ew_list[e]
+        for ai in common:
+            mp = atom_node2local[ai]
+            atom_ls[ai].append(mp[s])
+            atom_ld[ai].append(mp[d])
+            atom_dstg[ai].append(d)     # need degree of dst
+            atom_ew[ai].append(w)
+
+    # ---- 5) pack cached per-atom data ----
+    atom_data = []
+    for ai in range(m):
+        data = {
+            "nodes": atom_nodes_tensor[ai],      # (k,)
+            "node2local": atom_node2local[ai],   # python dict
+            "ls": torch.tensor(atom_ls[ai], dtype=torch.long, device=device),
+            "ld": torch.tensor(atom_ld[ai], dtype=torch.long, device=device),
+            "dstg": torch.tensor(atom_dstg[ai], dtype=torch.long, device=device),
+            "ew": torch.tensor(atom_ew[ai], dtype=torch.float32, device=device)
+                  if len(atom_ew[ai]) > 0 else torch.empty((0,), dtype=torch.float32, device=device),
+        }
+        atom_data.append(data)
+
+    # ---- 6) precompute local separator indices for neighbors to avoid Python loops later ----
+    for ai in range(m):
+        data = atom_data[ai]
+        # map neighbor index -> local indices tensor for the separator nodes
+        seps_local = {}
+        for v, sep in graph_y.decomp_tree[ai]:
+            # sep is a list of global node ids that form the separator between ai and v
+            # Map them to local indices within atom ai
+            if len(sep) == 0:
+                seps_local[v] = torch.empty((0,), dtype=torch.long, device=device)
+                continue
+            # node2local is a python dict mapping global node -> local index
+            idxs = torch.tensor([data['node2local'][n] for n in sep], dtype=torch.long, device=device)
+            seps_local[v] = idxs
+        data['seps_local'] = seps_local
+
+    graph_y.decomp_atom_data = atom_data
+
+
 def main():
     config = get_config()
 
@@ -148,6 +330,10 @@ def main():
         g.simplify(multiple=True, loops=True)
 
         atoms, separators = decom_h.recursive_decom(g, method="cmsa")
+        #print(f"[decomp] cached: #atoms={len(atoms)}, #seps={len(separators)}")
+
+        edge_w = graph_y.edge_attr[:, 0] if config["dist_weight"] else None
+        prepare_decomp_cache(graph_y, atoms, edge_weight=edge_w)
 
         # flatten nested lists once
         def _flatten(x):
@@ -204,6 +390,9 @@ def main():
     best_params = None
 
     for iteration_i in range(config["n_iterations"]):
+        #heng
+        config["_iter"] = iteration_i
+        #heng
         opt.zero_grad()
 
         loss = vi.vi_loss(dgmrf, vi_dist, graph_y, config)
@@ -361,6 +550,9 @@ def main():
 
         for name, graph in save_graphs.items():
             utils.save_graph(graph, "{}_graph".format(name), wandb.run.dir)
+
+
+
 
 if __name__ == "__main__":
     main()
