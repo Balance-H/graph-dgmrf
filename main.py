@@ -335,23 +335,21 @@ def main():
         edge_w = graph_y.edge_attr[:, 0] if config["dist_weight"] else None
         prepare_decomp_cache(graph_y, atoms, edge_weight=edge_w)
 
-        # flatten nested lists once
-        def _flatten(x):
-            out = []
+        def _count_groups(x):
             if isinstance(x, (list, tuple)):
                 if len(x) == 0:
-                    return out
+                    return 0
                 if all(isinstance(t, int) for t in x):
-                    out.append(list(x))
-                else:
-                    for y in x:
-                        out.extend(_flatten(y))
-            return out
+                    return 1
+                return sum(_count_groups(y) for y in x)
+            return 0
 
-        graph_y.atoms_decomp = _flatten(atoms)
-        graph_y.seps_decomp  = _flatten(separators)  
+        graph_y.atoms_decomp = atoms
+        graph_y.seps_decomp = separators
 
-        print(f"[decomp] cached: #atoms={len(graph_y.atoms_decomp)}, #seps={len(graph_y.seps_decomp)}")
+        print(
+            f"[decomp] cached: #atoms={_count_groups(atoms)}, #seps={_count_groups(separators)}"
+        )
 
         #heng
 
@@ -556,4 +554,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
